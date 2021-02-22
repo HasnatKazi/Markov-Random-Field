@@ -1,0 +1,229 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from collections import defaultdict
+from itertools import combinations, product
+
+class Message():
+    
+    def __init__(self, prob = {}):
+        self.prob = defaultdict(int)
+        self.prob.update(prob)
+      
+    @property
+    def support(self):
+        return set({k for k, v in self.prob.items() if v > 0})
+        
+    def normalize(self, in_place = True):
+        Z = sum(self.prob.values())
+        
+        if in_place:
+            self.prob = {k : v/Z for k, v in self.prob.items()}
+        
+        return Z
+        
+    def __call__(self, x):
+        return self.prob[x]
+    
+    def __repr__(self):
+        return str(dict(self.prob))
+    
+    def __mul__(self, other):
+        
+        new_support = self.support or other.support
+        new_prob = {}
+        
+        for k in new_support:
+            new_prob[k] = self.prob[k] * other.prob[k]
+            
+        return Message(new_prob)
+    
+    def __rmul__(self, other):
+        
+        new_prob = {}
+        
+        for k in self.support:
+            new_prob[k] = self.prob[k] * other
+            
+        return Message(new_prob)
+            
+    def __truediv__(self, other):
+        
+        new_support = self.support or other.support
+        new_prob = {}
+        
+        for k in new_support:
+            new_prob[k] = self.prob[k] / other.prob[k]
+            
+        return Message(new_prob)
+        
+    def __add__(self, other):
+        
+        new_support = self.support or other.support
+        new_prob = {}
+        
+        for k in new_support:
+            new_prob[k] = self.prob[k] + other.prob[k]
+            
+        return Message(new_prob)
+
+G = nx.fast_gnp_random_graph(10,0.3)
+nx.draw(G)
+[i for i in G[1]]
+    
+class MRF():
+    
+    def __init__(self):
+        
+        self.factors = {}
+        
+        self.variables = {}
+        
+        self.factor_G = None
+        
+    def initialize_messages(self):
+        
+        for var in self.variables:
+            
+            n_factors = len(self.factor_G[var])
+            n_states = len(self.variables[var])
+            init_prob = (1/n_states)**(1/n_factors)
+            init_message = Message({k:init_prob for k in self.variables[var]})
+            
+            for factor in self.factor_G[var]:
+                
+                self.factor_G.edges[var, factor]['f_2_v'] = init_message
+                self.factor_G.edges[var, factor]['v_2_f'] = init_message
+        
+    def message_from_var_to_factor(self, variable):
+        '''
+        Propagates messages from a variable to all the factors it is connected to.
+        '''
+        
+        # Get all incoming messages ('f_2_v' -> 'factor to variable').
+        messages_from_factors = {factor : self.factor_G.edges[variable, factor]['f_2_v']
+                                 for factor in self.factor_G[variable]}
+        
+        combined_message = np.prod(list(messages_from_factors.values()))
+        
+        for factor in self.factor_G[variable]:
+            # For each factor calculate the outgoing message ('v_2_f').
+            # This is calculated be discarding the corresponding incoming message.
+            self.factor_G.edges[variable, factor]['v_2_f'] = combined_message / messages_from_factors[factor]
+            
+    def message_from_factor_to_var(self, factor):
+        '''
+        Propagates messages from a factor to all the variables it is connected to.
+        '''
+        
+        # Get all incoming messages.
+        messages_from_vars = {var : self.factor_G.edges[var, factor]['v_2_f']
+                               for var in self.factor_G[factor]}
+        
+        # For each variable get its support, i.e. the space/values for which it takes a positive value.
+        supports = {var : message.support
+                    for var, message in messages_from_vars.items()}
+        
+        for var in self.factor_G[factor]:
+            
+            new_message = Message()
+            
+            # To calculate the message from a factor to a variable we need to carry out a summation over all possible combinations of values the other variables connected to the factor might take.
+            # 'all_possible_var_values' is the list of such combinations.
+            relevant_supports = [[(var_, value) for value in support] 
+                                 for var_, support in supports.items() if var_ != var]
+            
+            all_possible_var_values = product(*relevant_supports)
+            
+            for variables_combination in all_possible_var_values:
+                
+                # The message from factor to variable is obtained via a formula of the form:
+                #   SUM_X { f(var, X) PROD_{x in X} {Message_x} }
+                # 'product_term' is the last (right-most) term in the summarion.
+                
+                product_term = 1
+                
+                for param, value in variables_combination:
+                    product_term *= messages_from_vars[param](value)
+                    
+                params = {k:v for k,v in variables_combination}
+                
+                partial_message = Message(
+                    {x : self.factors[factor](var = x, **params) * product_term 
+                     for x in supports[var]}
+                    )
+                
+                new_message = new_message + partial_message
+            
+            self.G.edges[var, factor]['f_2_v'] = new_message
+            
+    def normalize_messages(self, var):
+        
+        messages_from_factors = {factor : self.factor_G.edges[var, factor]['f_2_v']
+                                 for factor in self.factor_G[var]}
+        
+        combined_message = np.prod(list(messages_from_factors.values()))
+        
+        Z_constant = combined_message.normalize()
+        
+        n_factors = len(self.factor_G[var])
+        
+        reweighting = (1/Z_constant)**(1/n_factors)
+        
+        for factor in self.factor_G[var]:
+            
+            self.factor_G.edges[var, factor]['f_2_v'] = reweighting * self.factor_G.edges[var, factor]['f_2_v']
+            
+    def belief_propagation(self, max_iter = 10, max_error = 1):
+        
+        i = 0
+        error = np.inf
+        while i < max_iter and  error > max_error:
+            
+            old_f_2_v = nx.get_edge_attributes(self.factor_G, 'f_2_v')
+            old_v_2_f = nx.get_edge_attributes(self.factor_G, 'v_2_f')
+            
+            for factor in self.factors:
+                self.message_from_factor_to_var(factor)
+                
+            for var in self.variables:
+                self.message_from_var_to_factor(var)
+                self.normalize_messages(var)
+            
+            new_f_2_v = nx.get_edge_attributes(self.factor_G, 'f_2_v')
+            new_v_2_f = nx.get_edge_attributes(self.factor_G, 'v_2_f')
+            
+            error_f_2_v = [new_f_2_v[k] - old_f_2_v[k] for k in new_f_2_v]
+            error_v_2_f = [new_v_2_f[k] - old_v_2_f[k] for k in new_v_2_f]
+            error = np.sum(np.abs(error_f_2_v)) + np.sum(np.abs(error_v_2_f))
+            i += 1
+            
+            print(i, '\t', error)
+        
+    def calc_belief(self):
+        
+        beliefs = {}
+        
+        for variable in self.variables:
+            
+            messages_from_factors = {factor : self.factor_G.edges[variable, factor]['f_2_v']
+                                     for factor in self.factor_G[variable]}
+            
+            combined_message = np.prod(list(messages_from_factors.values()))
+            
+            beliefs[variable] = combined_message
+            
+        return beliefs
+
+    def draw(self):
+        nodePos = nx.layout.spring_layout(self.factor_G)
+        nx.draw_networkx_nodes(self.factor_G, nodePos, node_shape = 's',
+                               node_size = 30, node_color = 'red',
+                               nodelist = self.factors)
+        nx.draw_networkx_nodes(self.factor_G, nodePos, node_shape = 'o',
+                               nodelist = self.variables)
+        nx.draw_networkx_edges(self.factor_G,nodePos)
+        nx.draw_networkx_labels(self.factor_G, nodePos, {k:k for k in self.variables}, font_size=14)
+
+
+
